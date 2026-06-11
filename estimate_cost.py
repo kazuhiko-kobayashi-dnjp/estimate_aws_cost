@@ -179,8 +179,13 @@ def flatten_message_content(content: Any) -> str:
 
 
 def slug_for_cwd(cwd: Path) -> str:
-    """カレントディレクトリを Claude Code のプロジェクトログ用スラッグに変換する。"""
-    return str(cwd.resolve()).replace("/", "-")
+    """カレントディレクトリを Claude Code のプロジェクトログ用スラッグに変換する。
+
+    Claude Code は英数字以外（/ _ . など）をすべて '-' に置換する。
+    例: /home/u/workspace/eval_bev_soft -> -home-u-workspace-eval-bev-soft
+    """
+    import re
+    return re.sub(r"[^a-zA-Z0-9]", "-", str(cwd.resolve()))
 
 
 def list_transcripts() -> List[Path]:
