@@ -386,6 +386,16 @@ class BedrockTokenCounter:
         self.client = session.client("bedrock-runtime", region_name=region)
 
     def count_converse(self, model_id: str, converse_input: Dict[str, Any]) -> int:
+        if not hasattr(self.client, "count_tokens"):
+            import botocore
+            raise SystemExit(
+                "Error: お使いの boto3/botocore は CountTokens API に未対応です。\n"
+                f"  現在の botocore: {botocore.__version__}（CountTokens には 1.40 以降が必要）\n"
+                "  対処: ライブラリを更新してください。\n"
+                "    pip install -U 'boto3>=1.40'\n"
+                "  ※ OS 同梱版(/usr/lib/python3/dist-packages)を使っている場合は、\n"
+                "     仮想環境(venv)を作って pip で新しい boto3 を入れるのが安全です。"
+            )
         try:
             resp = self.client.count_tokens(modelId=model_id, input={"converse": converse_input})
             return int(resp["inputTokens"])

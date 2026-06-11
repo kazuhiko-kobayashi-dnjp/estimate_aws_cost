@@ -24,6 +24,15 @@ pip install -r requirements.txt
 `estimate_cost.py` は MFA 必須の AWS 環境を想定し、既定プロファイルは `temp-mfa`。
 環境に合わせて `--profile` か環境変数 `AWS_PROFILE` で変更する。
 
+> **boto3 のバージョンに注意**: `CountTokens` API は比較的新しいため、**boto3 1.40 以降**が必要。
+> `'BedrockRuntime' object has no attribute 'count_tokens'` と出たら boto3 が古い。
+> 特に OS 同梱版（`/usr/lib/python3/dist-packages`）は古いことが多いので、
+> 仮想環境を作って新しい boto3 を入れるとよい:
+> ```bash
+> python3 -m venv .venv && source .venv/bin/activate
+> pip install -U 'boto3>=1.40'
+> ```
+
 ## 使い方（estimate_cost.py）
 
 ```bash
