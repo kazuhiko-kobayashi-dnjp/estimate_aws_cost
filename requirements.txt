@@ -1,0 +1,5 @@
+# estimate_cost.py 用（Amazon Bedrock CountTokens）
+boto3>=1.40
+
+# count_tokens.py 用（Anthropic API 直）
+anthropic>=0.40
