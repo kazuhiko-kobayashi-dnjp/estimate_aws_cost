@@ -377,6 +377,14 @@ def detect_model_from_transcript(path: Path) -> str | None:
     return found
 
 
+class PromptTooLong(Exception):
+    """CountTokens の 200,000 tokens/リクエスト上限を超えたことを示す。"""
+
+
+# CountTokens の 1 リクエスト上限（トークン）。これ未満になるよう分割して数える。
+COUNT_TOKENS_MAX = 200_000
+
+
 class BedrockTokenCounter:
     def __init__(self, profile: str | None, region: str):
         try:
@@ -401,6 +409,9 @@ class BedrockTokenCounter:
             return int(resp["inputTokens"])
         except ClientError as e:
             msg = str(e)
+            if "too long" in msg or "maximum" in msg:
+                # CountTokens は 1 リクエスト 200,000 tokens 上限。呼び出し側で分割集計する。
+                raise PromptTooLong(msg) from e
             if "doesn't support counting tokens" in msg or "model identifier is invalid" in msg:
                 supported = ", ".join(sorted(DEFAULT_RATES))
                 raise SystemExit(
@@ -419,6 +430,21 @@ class BedrockTokenCounter:
             raise SystemExit(f"Error: CountTokens 呼び出しに失敗しました: {msg}") from e
         except BotoCoreError as e:
             raise SystemExit(f"Error: AWS 接続に失敗しました: {e}") from e
+
+    def count_text(self, model_id: str, text: str) -> int:
+        """テキストのトークン数を数える。200,000 tokens/リクエスト上限を超える場合は
+        テキストを再帰的に分割して数え、合計を返す（トークン数は加算可能）。
+        """
+        if not text:
+            return 0
+        try:
+            return self.count_converse(model_id, build_converse_input_from_text(text))
+        except PromptTooLong:
+            # 文字単位で半分に割り、それぞれを数えて合算（1 文字まで割れば必ず上限未満になる）
+            if len(text) <= 1:
+                raise  # 1 文字で上限超過はあり得ない。想定外なので送出
+            mid = len(text) // 2
+            return self.count_text(model_id, text[:mid]) + self.count_text(model_id, text[mid:])
 
 
 def read_text_file(path: Path) -> str:
@@ -556,8 +582,9 @@ def main() -> int:
                 print(f"警告: ファイルが見つかりません: {fp}", file=sys.stderr)
                 continue
             text = read_text_file(path)
-            body = build_converse_input_from_text(text, system=args.system)
-            tokens = counter.count_converse(fallback_model, body)
+            # 大きいファイルは 200,000 tokens/リクエスト上限に当たるため分割集計する
+            full = (args.system + "\n" + text) if args.system else text
+            tokens = counter.count_text(fallback_model, full)
             rows.append({"label": str(path), "tokens": tokens, "chars": len(text)})
     if args.conversation_json:
         path = Path(args.conversation_json)
@@ -597,8 +624,8 @@ def main() -> int:
         r_in, r_out = resolve_rates(count_id, args.input_rate, args.output_rate)
         in_rate = args.input_rate if args.input_rate is not None else (in_rate if in_rate is not None else r_in)
         out_rate = args.output_rate if args.output_rate is not None else (out_rate if out_rate is not None else r_out)
-        in_tokens = counter.count_converse(count_id, build_converse_input_from_text(in_text)) if in_text else 0
-        out_tokens = counter.count_converse(count_id, build_converse_input_from_text(out_text)) if out_text else 0
+        in_tokens = counter.count_text(count_id, in_text)
+        out_tokens = counter.count_text(count_id, out_text)
         print_transcript_summary(path, display_model, in_tokens, out_tokens, n_in, n_out, in_rate, out_rate)
         return 0
     input_rate, output_rate = (None, None)
