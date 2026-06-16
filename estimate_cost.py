@@ -938,6 +938,90 @@ def print_workspace_month_summary(year: int, month: int) -> int:
     out_path = Path.cwd() / f"cost_{year}-{month:02d}.xlsx"
     wb.save(out_path)
     print(f"Saved: {out_path}", file=sys.stderr)
+
+    # ── コンソール出力 ──
+    JPY_STR = 150.0
+    W = 108
+    HDR = (
+        f"{'日時':<18}"
+        f"{'入力':>12}"
+        f"{'出力':>12}"
+        f"{'C書込':>12}"
+        f"{'C読取':>14}"
+        f"  {'コスト(USD)':>12}"
+        f"  {'モデル':<22}"
+        f"  プロジェクト"
+    )
+    print(f"\n=== workspace 月次集計 {year}-{month:02d} ===")
+    print("-" * W)
+    print(HDR)
+    print("-" * W)
+
+    for row_type, values in out_rows:
+        if row_type == "session":
+            # values: [type, label, date, week, in, out, cw, cr, cost_usd, cost_jpy, warn, proj, model, in_rate, out_rate]
+            dt_s   = values[1]
+            in_t   = values[4]
+            out_t  = values[5]
+            cw_t   = values[6]
+            cr_t   = values[7]
+            cost   = values[8]
+            proj   = values[11]
+            model  = values[12]
+            print(
+                f"{dt_s:<18}"
+                f"{in_t:>12,}"
+                f"{out_t:>12,}"
+                f"{cw_t:>12,}"
+                f"{cr_t:>14,}"
+                f"  ${cost:>11.4f}"
+                f"  {model:<22}"
+                f"  {proj}"
+            )
+        elif row_type in ("day_total", "week_total"):
+            in_t   = values[4]
+            out_t  = values[5]
+            cw_t   = values[6]
+            cr_t   = values[7]
+            cost   = values[8]
+            jpy    = values[9]
+            if row_type == "day_total":
+                date_str = values[2]   # "YYYY-MM-DD"
+                tag = f"[{date_str[5:7]}/{date_str[8:10]} 小計]"
+            else:
+                week_str = values[3]   # "W24"
+                tag = f"[第{week_str[1:]}週 小計]"
+            print(
+                f"  {tag:<16}"
+                f"{in_t:>12,}"
+                f"{out_t:>12,}"
+                f"{cw_t:>12,}"
+                f"{cr_t:>14,}"
+                f"  ${cost:>11.4f}"
+                f"  ({jpy:,}円)"
+            )
+            if row_type == "week_total":
+                print("~" * W)
+        elif row_type == "month_total":
+            label = values[1]
+            in_t  = values[4]
+            out_t = values[5]
+            cw_t  = values[6]
+            cr_t  = values[7]
+            cost  = values[8]
+            jpy   = values[9]
+            print("=" * W)
+            print(
+                f"  {'[' + label + ']':<16}"
+                f"{in_t:>12,}"
+                f"{out_t:>12,}"
+                f"{cw_t:>12,}"
+                f"{cr_t:>14,}"
+                f"  ${cost:>11.4f}"
+                f"  ({jpy:,}円)"
+            )
+            print("=" * W)
+
     return 0
 
 
