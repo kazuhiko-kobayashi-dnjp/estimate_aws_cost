@@ -363,12 +363,34 @@ def split_io_texts_from_transcript(path: Path) -> Tuple[str, str, int, int]:
     return "\n".join(input_parts), "\n".join(output_parts), n_in, n_out
 
 
-def calc_turn_cost(u: Dict[str, int], in_rate: float, out_rate: float) -> float:
-    """1ターン分の usage dict からコストを計算して返す（USD）。"""
+def _cache_write_tokens_5m(u: Dict[str, Any]) -> int:
+    """usage dict から 5分TTL キャッシュ書込トークン数を返す。"""
+    cc = u.get("cache_creation")
+    if isinstance(cc, dict):
+        return int(cc.get("ephemeral_5m_input_tokens", 0))
+    # 旧形式: cache_creation サブフィールドなし → 全量を 5m 扱い
+    return int(u.get("cache_creation_input_tokens", 0))
+
+
+def _cache_write_tokens_1h(u: Dict[str, Any]) -> int:
+    """usage dict から 1時間TTL キャッシュ書込トークン数を返す。"""
+    cc = u.get("cache_creation")
+    if isinstance(cc, dict):
+        return int(cc.get("ephemeral_1h_input_tokens", 0))
+    return 0
+
+
+def calc_turn_cost(u: Dict[str, Any], in_rate: float, out_rate: float) -> float:
+    """1ターン分の usage dict からコストを計算して返す（USD）。
+    5分TTL write = base×1.25、1時間TTL write = base×2.0、read = base×0.1。
+    """
+    w5m = _cache_write_tokens_5m(u)
+    w1h = _cache_write_tokens_1h(u)
     return (
         usd_for_tokens(u.get("input_tokens", 0), in_rate)
         + usd_for_tokens(u.get("output_tokens", 0), out_rate)
-        + usd_for_tokens(u.get("cache_creation_input_tokens", 0), in_rate * 1.25)
+        + usd_for_tokens(w5m, in_rate * 1.25)
+        + usd_for_tokens(w1h, in_rate * 2.0)
         + usd_for_tokens(u.get("cache_read_input_tokens", 0), in_rate * 0.1)
     )
 
@@ -385,6 +407,8 @@ def read_usage_from_transcript(path: Path) -> Dict[str, Any] | None:
         "input_tokens": 0,
         "output_tokens": 0,
         "cache_creation_input_tokens": 0,
+        "cache_creation_5m_tokens": 0,
+        "cache_creation_1h_tokens": 0,
         "cache_read_input_tokens": 0,
         "n_in": 0,
         "n_out": 0,
@@ -434,6 +458,8 @@ def read_usage_from_transcript(path: Path) -> Dict[str, Any] | None:
                 for k in ("input_tokens", "output_tokens",
                           "cache_creation_input_tokens", "cache_read_input_tokens"):
                     totals[k] += u.get(k, 0)
+                totals["cache_creation_5m_tokens"] += _cache_write_tokens_5m(u)
+                totals["cache_creation_1h_tokens"] += _cache_write_tokens_1h(u)
                 # ターン単位でモデルを解決してコストを計算
                 turn_model = msg.get("model") or ""
                 _, in_rate, out_rate = resolve_model_for_log(turn_model)
@@ -718,7 +744,9 @@ def list_workspace_transcripts_for_month(year: int, month: int) -> List[Path]:
 def _empty_grand() -> Dict[str, Any]:
     return {
         "input_tokens": 0, "output_tokens": 0,
-        "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "cache_creation_5m_tokens": 0, "cache_creation_1h_tokens": 0,
+        "cache_read_input_tokens": 0,
         "n_in": 0, "n_out": 0, "cost_usd": 0.0, "unknown_model_turns": 0,
     }
 
