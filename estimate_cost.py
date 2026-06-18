@@ -43,114 +43,6 @@ DEFAULT_PROFILE = "temp-mfa"
 WORKSPACE_ROOT = Path("/home/kazuhiko-kobayashi-dnjp/workspace")
 
 
-def _strip_region_prefix(model_id: str) -> str:
-    """us. / eu. / ap. などのクロスリージョン推論プレフィックスを除去する。"""
-    import re
-    return re.sub(r'^[a-z]{2,3}\.', '', model_id)
-
-
-def print_cloudwatch_summary(year: int, month: int, profile: str | None, region: str) -> int:
-    """CloudWatch の Bedrock メトリクスから指定月のトークン使用量を取得して表示する。
-
-    AWS/Bedrock 名前空間の InputTokenCount / OutputTokenCount を ModelId ディメンション別に
-    集計する。retry/abort を含む全 API コールが対象のため、JSONL 記録漏れを補完できる。
-    データ保持期間は15日（1分粒度）/ 63日（5分粒度）/ 455日（1時間粒度）/ 15か月（1日粒度）。
-    """
-    import datetime, calendar
-
-    try:
-        session = boto3.Session(profile_name=profile, region_name=region) if profile else boto3.Session(region_name=region)
-    except ProfileNotFound as e:
-        print(f"Error: AWS profile が見つかりません: {e}", file=sys.stderr)
-        return 1
-    cw = session.client("cloudwatch", region_name=region)
-
-    # 指定月の UTC 開始・終了（メトリクス Period は 86400秒=1日）
-    start = datetime.datetime(year, month, 1, tzinfo=datetime.timezone.utc)
-    last_day = calendar.monthrange(year, month)[1]
-    end = datetime.datetime(year, month, last_day, 23, 59, 59, tzinfo=datetime.timezone.utc)
-
-    # 利用中の ModelId 一覧を取得（ページネーション対応）
-    model_ids: list[str] = []
-    paginator = cw.get_paginator("list_metrics")
-    try:
-        for page in paginator.paginate(Namespace="AWS/Bedrock", MetricName="InputTokenCount"):
-            for m in page.get("Metrics", []):
-                for d in m.get("Dimensions", []):
-                    if d["Name"] == "ModelId" and d["Value"] not in model_ids:
-                        model_ids.append(d["Value"])
-    except ClientError as e:
-        code = e.response.get("Error", {}).get("Code", "")
-        if "AccessDenied" in code or "explicit deny" in str(e):
-            print("Error: CloudWatch へのアクセスが拒否されました。", file=sys.stderr)
-            print("  必要な IAM 権限: cloudwatch:ListMetrics / cloudwatch:GetMetricStatistics", file=sys.stderr)
-            print("  MFA セッションが期限切れの場合は取り直してください。", file=sys.stderr)
-            print(f"  使用プロファイル: {profile or '(default)'}, リージョン: {region}", file=sys.stderr)
-        else:
-            print(f"Error: CloudWatch API 呼び出し失敗: {e}", file=sys.stderr)
-        return 1
-
-    if not model_ids:
-        print(f"CloudWatch に AWS/Bedrock/InputTokenCount メトリクスが見つかりません。", file=sys.stderr)
-        print("  ・Bedrock の CloudWatch メトリクスは有効化が必要な場合があります。", file=sys.stderr)
-        print("  ・リージョン指定が正しいか確認してください（現在: " + region + "）", file=sys.stderr)
-        return 2
-
-    JPY = 150.0
-    grand_in = grand_out = grand_cost = 0.0
-
-    rows = []
-    for mid in sorted(model_ids):
-        bare_id = _strip_region_prefix(mid)
-        rate = DEFAULT_RATES.get(bare_id) or DEFAULT_RATES.get(mid)
-
-        def _get_sum(metric_name: str) -> float:
-            try:
-                resp = cw.get_metric_statistics(
-                    Namespace="AWS/Bedrock",
-                    MetricName=metric_name,
-                    Dimensions=[{"Name": "ModelId", "Value": mid}],
-                    StartTime=start,
-                    EndTime=end,
-                    Period=86400 * last_day,
-                    Statistics=["Sum"],
-                )
-                pts = resp.get("Datapoints", [])
-                return sum(p["Sum"] for p in pts) if pts else 0.0
-            except ClientError as e:
-                print(f"  警告: {metric_name} 取得失敗 ({mid}): {e}", file=sys.stderr)
-                return 0.0
-
-        in_tok  = _get_sum("InputTokenCount")
-        out_tok = _get_sum("OutputTokenCount")
-        if in_tok == 0 and out_tok == 0:
-            continue
-
-        cost = 0.0
-        if rate:
-            cost = usd_for_tokens(int(in_tok), rate["input"]) + usd_for_tokens(int(out_tok), rate["output"])
-        grand_in  += in_tok
-        grand_out += out_tok
-        grand_cost += cost
-        rows.append({"model": mid, "in": int(in_tok), "out": int(out_tok), "cost": cost, "rate": rate})
-
-    W = 100
-    print(f"\n=== CloudWatch Bedrock メトリクス {year}-{month:02d} (region={region}) ===")
-    print(f"  ※ retry/abort/Workflow内部コール含む全 API コールのトークン数")
-    print("-" * W)
-    print(f"  {'モデル':<44}  {'入力トークン':>14}  {'出力トークン':>14}  {'コスト(USD)':>12}")
-    print("-" * W)
-    for r in rows:
-        cost_s = f"${r['cost']:.4f}" if r["rate"] else "(レート不明)"
-        print(f"  {r['model']:<44}  {r['in']:>14,}  {r['out']:>14,}  {cost_s:>12}")
-    print("=" * W)
-    cost_s = f"${grand_cost:.4f}  (約 {grand_cost * JPY:,.1f} 円)"
-    print(f"  {'合計':<44}  {int(grand_in):>14,}  {int(grand_out):>14,}  {cost_s}")
-    print("=" * W)
-    if grand_cost == 0.0 and rows:
-        print("  ※ 一部モデルのレートが未定義のためコスト合計は 0。DEFAULT_RATES に追加してください。")
-    return 0
-
 
 def resolve_model_for_log(log_model: str) -> Tuple[str, float | None, float | None]:
     """ログの model 名を (CountTokens 用 Bedrock ID, 入力レート, 出力レート) に解決する。
@@ -1362,8 +1254,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--all", action="store_true", help="~/.claude/projects 以下の全ログをターン単位レートで集計して表示する。")
     p.add_argument("--month", nargs="?", const="current", metavar="YYYY-MM",
                    help="workspace 配下の全プロジェクトについて指定月の総合計を表示。省略時は当月。例: --month 2026-05")
-    p.add_argument("--cloudwatch", nargs="?", const="current", metavar="YYYY-MM",
-                   help="CloudWatch の Bedrock メトリクスから指定月の実 API コール数を取得（retry/Workflow内部コール含む）。省略時は当月。")
     p.add_argument("--system", help="system prompt を追加。")
     p.add_argument("--model-id", "-m", default=None, help="Bedrock modelId。未指定かつ --transcript 時はログから自動検出。例: anthropic.claude-opus-4-6-v1")
     p.add_argument("--profile", default=os.environ.get("AWS_PROFILE", DEFAULT_PROFILE), help=f"AWS profile 名。未指定時は AWS_PROFILE か '{DEFAULT_PROFILE}'。")
@@ -1390,17 +1280,6 @@ def main() -> int:
             return print_workspace_month_summary(dt.year, dt.month)
         except ValueError:
             print(f"Error: --month の形式が不正です: '{args.month}'。YYYY-MM で指定してください。", file=sys.stderr)
-            return 2
-    if args.cloudwatch is not None:
-        import datetime
-        if args.cloudwatch == "current":
-            now = datetime.date.today()
-            return print_cloudwatch_summary(now.year, now.month, args.profile, args.region)
-        try:
-            dt = datetime.datetime.strptime(args.cloudwatch, "%Y-%m")
-            return print_cloudwatch_summary(dt.year, dt.month, args.profile, args.region)
-        except ValueError:
-            print(f"Error: --cloudwatch の形式が不正です: '{args.cloudwatch}'。YYYY-MM で指定してください。", file=sys.stderr)
             return 2
     # 入力が一つも指定されなければ、カレントプロジェクトの最新ログを集計する（既定動作）。
     if not args.file and not args.text and not args.stdin and not args.conversation_json and not args.transcript:
