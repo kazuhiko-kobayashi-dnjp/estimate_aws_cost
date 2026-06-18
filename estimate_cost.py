@@ -43,6 +43,115 @@ DEFAULT_PROFILE = "temp-mfa"
 WORKSPACE_ROOT = Path("/home/kazuhiko-kobayashi-dnjp/workspace")
 
 
+def _strip_region_prefix(model_id: str) -> str:
+    """us. / eu. / ap. などのクロスリージョン推論プレフィックスを除去する。"""
+    import re
+    return re.sub(r'^[a-z]{2,3}\.', '', model_id)
+
+
+def print_cloudwatch_summary(year: int, month: int, profile: str | None, region: str) -> int:
+    """CloudWatch の Bedrock メトリクスから指定月のトークン使用量を取得して表示する。
+
+    AWS/Bedrock 名前空間の InputTokenCount / OutputTokenCount を ModelId ディメンション別に
+    集計する。retry/abort を含む全 API コールが対象のため、JSONL 記録漏れを補完できる。
+    データ保持期間は15日（1分粒度）/ 63日（5分粒度）/ 455日（1時間粒度）/ 15か月（1日粒度）。
+    """
+    import datetime, calendar
+
+    try:
+        session = boto3.Session(profile_name=profile, region_name=region) if profile else boto3.Session(region_name=region)
+    except ProfileNotFound as e:
+        print(f"Error: AWS profile が見つかりません: {e}", file=sys.stderr)
+        return 1
+    cw = session.client("cloudwatch", region_name=region)
+
+    # 指定月の UTC 開始・終了（メトリクス Period は 86400秒=1日）
+    start = datetime.datetime(year, month, 1, tzinfo=datetime.timezone.utc)
+    last_day = calendar.monthrange(year, month)[1]
+    end = datetime.datetime(year, month, last_day, 23, 59, 59, tzinfo=datetime.timezone.utc)
+
+    # 利用中の ModelId 一覧を取得（ページネーション対応）
+    model_ids: list[str] = []
+    paginator = cw.get_paginator("list_metrics")
+    try:
+        for page in paginator.paginate(Namespace="AWS/Bedrock", MetricName="InputTokenCount"):
+            for m in page.get("Metrics", []):
+                for d in m.get("Dimensions", []):
+                    if d["Name"] == "ModelId" and d["Value"] not in model_ids:
+                        model_ids.append(d["Value"])
+    except ClientError as e:
+        code = e.response.get("Error", {}).get("Code", "")
+        if "AccessDenied" in code or "explicit deny" in str(e):
+            print("Error: CloudWatch へのアクセスが拒否されました。", file=sys.stderr)
+            print("  必要な IAM 権限: cloudwatch:ListMetrics / cloudwatch:GetMetricStatistics", file=sys.stderr)
+            print("  MFA セッションが期限切れの場合は取り直してください。", file=sys.stderr)
+            print(f"  使用プロファイル: {profile or '(default)'}, リージョン: {region}", file=sys.stderr)
+        else:
+            print(f"Error: CloudWatch API 呼び出し失敗: {e}", file=sys.stderr)
+        return 1
+
+    if not model_ids:
+        print(f"CloudWatch に AWS/Bedrock/InputTokenCount メトリクスが見つかりません。", file=sys.stderr)
+        print("  ・Bedrock の CloudWatch メトリクスは有効化が必要な場合があります。", file=sys.stderr)
+        print("  ・リージョン指定が正しいか確認してください（現在: " + region + "）", file=sys.stderr)
+        return 2
+
+    JPY = 150.0
+    grand_in = grand_out = grand_cost = 0.0
+
+    rows = []
+    for mid in sorted(model_ids):
+        bare_id = _strip_region_prefix(mid)
+        rate = DEFAULT_RATES.get(bare_id) or DEFAULT_RATES.get(mid)
+
+        def _get_sum(metric_name: str) -> float:
+            try:
+                resp = cw.get_metric_statistics(
+                    Namespace="AWS/Bedrock",
+                    MetricName=metric_name,
+                    Dimensions=[{"Name": "ModelId", "Value": mid}],
+                    StartTime=start,
+                    EndTime=end,
+                    Period=86400 * last_day,
+                    Statistics=["Sum"],
+                )
+                pts = resp.get("Datapoints", [])
+                return sum(p["Sum"] for p in pts) if pts else 0.0
+            except ClientError as e:
+                print(f"  警告: {metric_name} 取得失敗 ({mid}): {e}", file=sys.stderr)
+                return 0.0
+
+        in_tok  = _get_sum("InputTokenCount")
+        out_tok = _get_sum("OutputTokenCount")
+        if in_tok == 0 and out_tok == 0:
+            continue
+
+        cost = 0.0
+        if rate:
+            cost = usd_for_tokens(int(in_tok), rate["input"]) + usd_for_tokens(int(out_tok), rate["output"])
+        grand_in  += in_tok
+        grand_out += out_tok
+        grand_cost += cost
+        rows.append({"model": mid, "in": int(in_tok), "out": int(out_tok), "cost": cost, "rate": rate})
+
+    W = 100
+    print(f"\n=== CloudWatch Bedrock メトリクス {year}-{month:02d} (region={region}) ===")
+    print(f"  ※ retry/abort/Workflow内部コール含む全 API コールのトークン数")
+    print("-" * W)
+    print(f"  {'モデル':<44}  {'入力トークン':>14}  {'出力トークン':>14}  {'コスト(USD)':>12}")
+    print("-" * W)
+    for r in rows:
+        cost_s = f"${r['cost']:.4f}" if r["rate"] else "(レート不明)"
+        print(f"  {r['model']:<44}  {r['in']:>14,}  {r['out']:>14,}  {cost_s:>12}")
+    print("=" * W)
+    cost_s = f"${grand_cost:.4f}  (約 {grand_cost * JPY:,.1f} 円)"
+    print(f"  {'合計':<44}  {int(grand_in):>14,}  {int(grand_out):>14,}  {cost_s}")
+    print("=" * W)
+    if grand_cost == 0.0 and rows:
+        print("  ※ 一部モデルのレートが未定義のためコスト合計は 0。DEFAULT_RATES に追加してください。")
+    return 0
+
+
 def resolve_model_for_log(log_model: str) -> Tuple[str, float | None, float | None]:
     """ログの model 名を (CountTokens 用 Bedrock ID, 入力レート, 出力レート) に解決する。
 
@@ -395,28 +504,27 @@ def calc_turn_cost(u: Dict[str, Any], in_rate: float, out_rate: float) -> float:
     )
 
 
-def read_usage_from_transcript(path: Path) -> Dict[str, Any] | None:
-    """会話ログの assistant ターンから usage を直接集計して返す。
+import datetime as _dt
 
-    ターンごとに記録されたモデル名でレートを解決し、コストも同時に計算する。
-    usage フィールドが一件も存在しなければ None（CountTokens フォールバック用）。
-    戻り値の "cost_usd" はターンごとに正しいモデルレートを適用した合計コスト。
-    "unknown_model_turns" にはレート未解決のターン数を返す。
-    """
-    totals: Dict[str, Any] = {
-        "input_tokens": 0,
-        "output_tokens": 0,
+
+def _empty_grand() -> Dict[str, Any]:
+    return {
+        "input_tokens": 0, "output_tokens": 0,
         "cache_creation_input_tokens": 0,
-        "cache_creation_5m_tokens": 0,
-        "cache_creation_1h_tokens": 0,
+        "cache_creation_5m_tokens": 0, "cache_creation_1h_tokens": 0,
         "cache_read_input_tokens": 0,
-        "n_in": 0,
-        "n_out": 0,
-        "cost_usd": 0.0,
-        "unknown_model_turns": 0,
+        "n_in": 0, "n_out": 0, "cost_usd": 0.0, "unknown_model_turns": 0,
     }
-    found = False
-    prev_key: tuple | None = None  # 連続重複除去用
+
+
+def _iter_turns_from_file(path: Path):
+    """JSONL ファイルをターン単位でイテレートする。
+
+    assistant ターンごとに (local_date, usage_dict, model_str) を yield する。
+    timestamp がなければ local_date=None。user ターンは n_in カウント用に
+    (None, None, None) を yield する（呼び出し側で role を区別しないため
+    type="user" のみ (local_date, "user", None) を yield）。
+    """
     with path.open(encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -428,11 +536,20 @@ def read_usage_from_transcript(path: Path) -> Dict[str, Any] | None:
                 continue
             if not isinstance(o, dict):
                 continue
+            ts = o.get("timestamp")
+            local_date = None
+            if isinstance(ts, str):
+                try:
+                    local_date = _dt.datetime.fromisoformat(
+                        ts.replace("Z", "+00:00")
+                    ).astimezone().date()
+                except ValueError:
+                    pass
             turn_type = o.get("type")
             if turn_type == "user":
                 msg = o.get("message")
                 if isinstance(msg, dict) and msg.get("role") == "user":
-                    totals["n_in"] += 1
+                    yield (local_date, "user", None)
             elif turn_type == "assistant":
                 msg = o.get("message")
                 if not isinstance(msg, dict):
@@ -440,38 +557,116 @@ def read_usage_from_transcript(path: Path) -> Dict[str, Any] | None:
                 u = msg.get("usage")
                 if not isinstance(u, dict):
                     continue
-                # Claude Code は同一レスポンスを複数回 JSONL に書くことがある。
-                # message.id + usage の組み合わせが前のターンと同一なら重複とみなしスキップ。
-                dedup_key = (
-                    msg.get("id", ""),
-                    msg.get("model", ""),
-                    u.get("input_tokens", 0),
-                    u.get("output_tokens", 0),
-                    u.get("cache_creation_input_tokens", 0),
-                    u.get("cache_read_input_tokens", 0),
-                )
-                if dedup_key == prev_key:
-                    continue
-                prev_key = dedup_key
-                found = True
-                totals["n_out"] += 1
-                for k in ("input_tokens", "output_tokens",
-                          "cache_creation_input_tokens", "cache_read_input_tokens"):
-                    totals[k] += u.get(k, 0)
-                totals["cache_creation_5m_tokens"] += _cache_write_tokens_5m(u)
-                totals["cache_creation_1h_tokens"] += _cache_write_tokens_1h(u)
-                # ターン単位でモデルを解決してコストを計算
-                turn_model = msg.get("model") or ""
-                _, in_rate, out_rate = resolve_model_for_log(turn_model)
-                if in_rate is None:
-                    r = DEFAULT_RATES.get(turn_model)
-                    if r:
-                        in_rate, out_rate = r["input"], r["output"]
-                if in_rate is not None and out_rate is not None:
-                    totals["cost_usd"] += calc_turn_cost(u, in_rate, out_rate)
-                else:
-                    totals["unknown_model_turns"] += 1
+                yield (local_date, msg, u)
+
+
+def _accumulate_turn(totals: Dict[str, Any], u: Dict[str, Any], model: str) -> None:
+    """1ターン分の usage を totals に加算する（コスト計算込み）。"""
+    totals["n_out"] += 1
+    for k in ("input_tokens", "output_tokens",
+              "cache_creation_input_tokens", "cache_read_input_tokens"):
+        totals[k] += u.get(k, 0)
+    totals["cache_creation_5m_tokens"] += _cache_write_tokens_5m(u)
+    totals["cache_creation_1h_tokens"] += _cache_write_tokens_1h(u)
+    _, in_rate, out_rate = resolve_model_for_log(model)
+    if in_rate is None:
+        r = DEFAULT_RATES.get(model)
+        if r:
+            in_rate, out_rate = r["input"], r["output"]
+    if in_rate is not None and out_rate is not None:
+        totals["cost_usd"] += calc_turn_cost(u, in_rate, out_rate)
+    else:
+        totals["unknown_model_turns"] += 1
+
+
+def count_subagents(path: Path) -> int:
+    """セッションの subagents/ ディレクトリにある agent-*.jsonl の件数を返す。"""
+    sub_dir = path.parent / path.stem / "subagents"
+    if not sub_dir.is_dir():
+        return 0
+    return sum(1 for _ in sub_dir.glob("agent-*.jsonl"))
+
+
+# Workflow のキャッシュウォームアップ呼び出し（JSONL 未記録）が顕在化するしきい値。
+# 観測データ: n_sub=152 で実コストが JSONL 集計の約1.87倍になった。
+# n_sub=1~4 では乖離なし。データ点が少ないため係数化せず警告のみとする。
+SUBAGENT_WARN_THRESHOLD = 10
+
+
+def read_usage_from_transcript(path: Path) -> Dict[str, Any] | None:
+    """会話ログの assistant ターンから usage を直接集計して返す（セッション合計）。
+
+    subagents/ も含めて集計。seen_keys で重複除去。
+    CountTokens フォールバック用: usage が 1 件もなければ None を返す。
+    """
+    totals: Dict[str, Any] = {
+        "input_tokens": 0, "output_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "cache_creation_5m_tokens": 0, "cache_creation_1h_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "n_in": 0, "n_out": 0, "cost_usd": 0.0, "unknown_model_turns": 0,
+    }
+    seen_keys: set = set()
+    found = False
+    paths = [path]
+    sub_dir = path.parent / path.stem / "subagents"
+    if sub_dir.is_dir():
+        paths += sorted(sub_dir.glob("*.jsonl"))
+    for p in paths:
+        for item in _iter_turns_from_file(p):
+            local_date, msg_or_role, u = item
+            if msg_or_role == "user":
+                totals["n_in"] += 1
+                continue
+            if u is None:
+                continue
+            msg = msg_or_role
+            dedup_key = (
+                msg.get("id", ""), msg.get("model", ""),
+                u.get("input_tokens", 0), u.get("output_tokens", 0),
+                u.get("cache_creation_input_tokens", 0), u.get("cache_read_input_tokens", 0),
+            )
+            if dedup_key in seen_keys:
+                continue
+            seen_keys.add(dedup_key)
+            found = True
+            _accumulate_turn(totals, u, msg.get("model") or "")
     return totals if found else None
+
+
+def read_usage_by_date_from_transcript(
+    path: Path, seen_keys: set
+) -> Dict[Any, Dict[str, Any]]:
+    """セッション（+ subagents/）をターンの実行日付ごとに集計して返す。
+
+    戻り値: {local_date: totals_dict}。date=None は timestamp なしターン用。
+    seen_keys はセッション間重複除去のために呼び出し側で管理する。
+    """
+    import collections
+    by_date: Dict[Any, Dict[str, Any]] = collections.defaultdict(_empty_grand)
+    paths = [path]
+    sub_dir = path.parent / path.stem / "subagents"
+    if sub_dir.is_dir():
+        paths += sorted(sub_dir.glob("*.jsonl"))
+    for p in paths:
+        for item in _iter_turns_from_file(p):
+            local_date, msg_or_role, u = item
+            if msg_or_role == "user":
+                by_date[local_date]["n_in"] += 1
+                continue
+            if u is None:
+                continue
+            msg = msg_or_role
+            dedup_key = (
+                msg.get("id", ""), msg.get("model", ""),
+                u.get("input_tokens", 0), u.get("output_tokens", 0),
+                u.get("cache_creation_input_tokens", 0), u.get("cache_read_input_tokens", 0),
+            )
+            if dedup_key in seen_keys:
+                continue
+            seen_keys.add(dedup_key)
+            _accumulate_turn(by_date[local_date], u, msg.get("model") or "")
+    return dict(by_date)
 
 
 def detect_model_from_transcript(path: Path) -> str | None:
@@ -712,43 +907,30 @@ def session_timestamp(path: Path) -> float:
 def list_workspace_transcripts_for_month(year: int, month: int) -> List[Path]:
     """WORKSPACE_ROOT 配下の全プロジェクトについて、指定月の .jsonl を降順で返す。
 
-    日付判定は JSONL 内の最初のメッセージの timestamp を使い、mtime ではなくセッション開始日で絞る。
-    ~/.claude/projects/ 内のサブディレクトリ名は workspace パスのスラッグ形式なので、
-    WORKSPACE_ROOT に対応するスラッグ prefix でフィルタする。
+    日付判定は JSONL 内の最初のメッセージの timestamp（UTC）をローカル時刻に変換して行う。
+    subagents/ 配下のファイルは除外する（メイン JSONL 経由で集計するため）。
     """
-    import re, calendar
+    import re, calendar, datetime
     base = Path.home() / ".claude" / "projects"
     if not base.is_dir():
         return []
-    # /home/.../.../workspace → スラッグ prefix（例: -home-u-workspace）
     prefix = re.sub(r"[^a-zA-Z0-9]", "-", str(WORKSPACE_ROOT.resolve()))
-    # 月の開始・終了エポック
-    start_ts = __import__("time").mktime(__import__("datetime").date(year, month, 1).timetuple())
+    # 月の開始・終了をローカル時刻のエポック秒で定義
+    start_ts = datetime.datetime(year, month, 1, 0, 0, 0).timestamp()
     last_day = calendar.monthrange(year, month)[1]
-    end_ts = __import__("time").mktime(
-        __import__("datetime").datetime(year, month, last_day, 23, 59, 59).timetuple()
-    )
+    end_ts = datetime.datetime(year, month, last_day, 23, 59, 59).timestamp()
     results: List[Path] = []
     for proj_dir in base.iterdir():
         if not proj_dir.is_dir():
             continue
         if not proj_dir.name.startswith(prefix):
             continue
+        # glob("*.jsonl") のみ（subagents/ は除外）
         for p in proj_dir.glob("*.jsonl"):
             st = session_timestamp(p)
             if start_ts <= st <= end_ts:
                 results.append(p)
     return sorted(results, key=session_timestamp, reverse=True)
-
-
-def _empty_grand() -> Dict[str, Any]:
-    return {
-        "input_tokens": 0, "output_tokens": 0,
-        "cache_creation_input_tokens": 0,
-        "cache_creation_5m_tokens": 0, "cache_creation_1h_tokens": 0,
-        "cache_read_input_tokens": 0,
-        "n_in": 0, "n_out": 0, "cost_usd": 0.0, "unknown_model_turns": 0,
-    }
 
 
 def _add_usage(grand: Dict[str, Any], u: Dict[str, Any]) -> None:
@@ -768,21 +950,41 @@ def print_workspace_month_summary(year: int, month: int) -> int:
         return 1
 
     JPY = 150.0
-    logs = list_workspace_transcripts_for_month(year, month)
+    # list_workspace_transcripts_for_month は「セッション開始月」で絞るが、
+    # 隣月跨ぎのセッションも取りこぼさないよう前後1か月を含めて取得し、
+    # 実際のターン日付が対象月内のものだけを集計する。
+    import calendar as _cal
+    prev_year, prev_month = (year, month - 1) if month > 1 else (year - 1, 12)
+    next_year, next_month = (year, month + 1) if month < 12 else (year + 1, 1)
+    candidate_logs: List[Path] = []
+    for y, m in ((prev_year, prev_month), (year, month), (next_year, next_month)):
+        candidate_logs += list_workspace_transcripts_for_month(y, m)
+    # 重複除去（同じPathが複数月にまたがって返ることはないが念のため）
+    seen_paths: set = set()
+    logs: List[Path] = []
+    for p in candidate_logs:
+        if p not in seen_paths:
+            seen_paths.add(p)
+            logs.append(p)
+
     if not logs:
         print(f"No logs found for {year}-{month:02d} under workspace.", file=sys.stderr)
         return 2
 
+    target_year, target_month = year, month
+    month_start = datetime.date(target_year, target_month, 1)
+    month_end   = datetime.date(target_year, target_month, _cal.monthrange(target_year, target_month)[1])
+
     grand = _empty_grand()
+    # rows: [(date, session_start_dt, proj, usage_for_that_date, model, in_rate, out_rate)]
     rows = []
     skipped = 0
+    global_seen_keys: set = set()  # セッション間の重複除去
     for p in logs:
-        u = read_usage_from_transcript(p)
-        if u is None:
+        by_date = read_usage_by_date_from_transcript(p, global_seen_keys)
+        if not by_date:
             skipped += 1
             continue
-        ts = session_timestamp(p)
-        dt = datetime.datetime.fromtimestamp(ts)
         proj = p.parent.name[-40:]
         log_model = detect_model_from_transcript(p) or ""
         _, in_rate, out_rate = resolve_model_for_log(log_model)
@@ -790,14 +992,28 @@ def print_workspace_month_summary(year: int, month: int) -> int:
             r2 = DEFAULT_RATES.get(log_model)
             if r2:
                 in_rate, out_rate = r2["input"], r2["output"]
-        rows.append({"dt": dt, "proj": proj, "usage": u,
-                     "model": log_model, "in_rate": in_rate, "out_rate": out_rate})
-        _add_usage(grand, u)
+        session_dt = datetime.datetime.fromtimestamp(session_timestamp(p))
+        n_sub = count_subagents(p)
+        for d, u in by_date.items():
+            if u["n_out"] == 0:
+                continue
+            # timestamp なしターン(d=None)は session 開始日に帰属させる
+            effective_date = d if d is not None else session_dt.date()
+            if not (month_start <= effective_date <= month_end):
+                continue
+            rows.append({
+                "date": effective_date,
+                "session_dt": session_dt,
+                "proj": proj, "usage": u,
+                "model": log_model, "in_rate": in_rate, "out_rate": out_rate,
+                "n_sub": n_sub,
+            })
+            _add_usage(grand, u)
 
     if skipped:
         print(f"* {skipped} logs skipped (no usage field)", file=sys.stderr)
 
-    rows_asc = sorted(rows, key=lambda r: r["dt"])
+    rows_asc = sorted(rows, key=lambda r: (r["date"], r["session_dt"]))
 
     # ── データ行を組み立てる ──
     EMPTY4 = ["", "", "", ""]
@@ -809,7 +1025,7 @@ def print_workspace_month_summary(year: int, month: int) -> int:
                 g["input_tokens"], g["output_tokens"],
                 g["cache_creation_input_tokens"], g["cache_read_input_tokens"],
                 round(g["cost_usd"], 4), round(g["cost_usd"] * JPY),
-                warn] + EMPTY4
+                warn, g["n_out"]] + EMPTY4
 
     out_rows: List[tuple] = []  # (row_type, [values])
     day_grand = _empty_grand()
@@ -832,8 +1048,8 @@ def print_workspace_month_summary(year: int, month: int) -> int:
 
     for r in rows_asc:
         u = r["usage"]
-        d = r["dt"].date()
-        wk = r["dt"].isocalendar()[1]
+        d = r["date"]
+        wk = d.isocalendar()[1]
 
         if cur_week is not None and wk != cur_week:
             flush_day(cur_day)
@@ -848,10 +1064,12 @@ def print_workspace_month_summary(year: int, month: int) -> int:
         cur_day = d
         cur_week = wk
 
+        n_sub = r.get("n_sub", 0)
+        warn_sub = f"⚠n_sub={n_sub}" if n_sub >= SUBAGENT_WARN_THRESHOLD else (n_sub if n_sub else "")
         out_rows.append(("session", [
             "session",
-            r["dt"].strftime("%Y-%m-%d %H:%M"),
-            r["dt"].strftime("%Y-%m-%d"),
+            r["session_dt"].strftime("%Y-%m-%d %H:%M"),
+            d.strftime("%Y-%m-%d"),
             f"W{wk:02d}",
             u["input_tokens"],
             u["output_tokens"],
@@ -860,10 +1078,12 @@ def print_workspace_month_summary(year: int, month: int) -> int:
             round(u["cost_usd"], 4),
             round(u["cost_usd"] * JPY),
             u["unknown_model_turns"] or "",
+            u["n_out"],
             r["proj"],
             r["model"],
             r["in_rate"] if r["in_rate"] is not None else "",
             r["out_rate"] if r["out_rate"] is not None else "",
+            warn_sub,
         ]))
         _add_usage(day_grand, u)
         _add_usage(week_grand, u)
@@ -881,10 +1101,10 @@ def print_workspace_month_summary(year: int, month: int) -> int:
     HEADER = [
         "type", "label", "date", "iso_week",
         "input_tokens", "output_tokens", "cache_write_tokens", "cache_read_tokens",
-        "cost_usd", "cost_jpy", "unresolved_turns", "project",
-        "model", "input_rate", "output_rate",
+        "cost_usd", "cost_jpy", "unresolved_turns", "calls", "project",
+        "model", "input_rate", "output_rate", "n_sub",
     ]
-    COL_WIDTHS = [12, 22, 12, 8, 14, 14, 16, 14, 10, 10, 14, 44, 30, 11, 12]
+    COL_WIDTHS = [12, 22, 12, 8, 14, 14, 16, 14, 10, 10, 14, 8, 44, 30, 11, 12, 12]
 
     BG_HEADER  = "1F4E79"
     BG_SESSION = ["FFFFFF", "F2F2F2"]
@@ -956,9 +1176,10 @@ def print_workspace_month_summary(year: int, month: int) -> int:
             cells[ci].number_format = FMT_INT
         cells[8].number_format = FMT_USD   # cost_usd
         cells[9].number_format = FMT_JPY   # cost_jpy
+        cells[11].number_format = FMT_INT  # calls
         if row_type == "session":
-            cells[13].number_format = FMT_RATE  # input_rate
-            cells[14].number_format = FMT_RATE  # output_rate
+            cells[14].number_format = FMT_RATE  # input_rate
+            cells[15].number_format = FMT_RATE  # output_rate
 
     for i, w in enumerate(COL_WIDTHS, 1):
         ws.column_dimensions[get_column_letter(i)].width = w
@@ -969,7 +1190,7 @@ def print_workspace_month_summary(year: int, month: int) -> int:
 
     # ── コンソール出力 ──
     JPY_STR = 150.0
-    W = 108
+    W = 130
     HDR = (
         f"{'日時':<18}"
         f"{'入力':>12}"
@@ -977,6 +1198,8 @@ def print_workspace_month_summary(year: int, month: int) -> int:
         f"{'C書込':>12}"
         f"{'C読取':>14}"
         f"  {'コスト(USD)':>12}"
+        f"  {'calls':>6}"
+        f"  {'n_sub':>6}"
         f"  {'モデル':<22}"
         f"  プロジェクト"
     )
@@ -987,15 +1210,17 @@ def print_workspace_month_summary(year: int, month: int) -> int:
 
     for row_type, values in out_rows:
         if row_type == "session":
-            # values: [type, label, date, week, in, out, cw, cr, cost_usd, cost_jpy, warn, proj, model, in_rate, out_rate]
+            # values: [type, label, date, week, in, out, cw, cr, cost_usd, cost_jpy, warn, calls, proj, model, in_rate, out_rate, n_sub]
             dt_s   = values[1]
             in_t   = values[4]
             out_t  = values[5]
             cw_t   = values[6]
             cr_t   = values[7]
             cost   = values[8]
-            proj   = values[11]
-            model  = values[12]
+            calls  = values[11]
+            proj   = values[12]
+            model  = values[13]
+            n_sub_val = values[16] if len(values) > 16 else ""
             print(
                 f"{dt_s:<18}"
                 f"{in_t:>12,}"
@@ -1003,6 +1228,8 @@ def print_workspace_month_summary(year: int, month: int) -> int:
                 f"{cw_t:>12,}"
                 f"{cr_t:>14,}"
                 f"  ${cost:>11.4f}"
+                f"  {calls:>6}"
+                f"  {str(n_sub_val):>6}"
                 f"  {model:<22}"
                 f"  {proj}"
             )
@@ -1013,6 +1240,7 @@ def print_workspace_month_summary(year: int, month: int) -> int:
             cr_t   = values[7]
             cost   = values[8]
             jpy    = values[9]
+            calls  = values[11]
             if row_type == "day_total":
                 date_str = values[2]   # "YYYY-MM-DD"
                 tag = f"[{date_str[5:7]}/{date_str[8:10]} 小計]"
@@ -1026,6 +1254,7 @@ def print_workspace_month_summary(year: int, month: int) -> int:
                 f"{cw_t:>12,}"
                 f"{cr_t:>14,}"
                 f"  ${cost:>11.4f}"
+                f"  {calls:>6}"
                 f"  ({jpy:,}円)"
             )
             if row_type == "week_total":
@@ -1038,6 +1267,7 @@ def print_workspace_month_summary(year: int, month: int) -> int:
             cr_t  = values[7]
             cost  = values[8]
             jpy   = values[9]
+            calls = values[11]
             print("=" * W)
             print(
                 f"  {'[' + label + ']':<16}"
@@ -1046,6 +1276,7 @@ def print_workspace_month_summary(year: int, month: int) -> int:
                 f"{cw_t:>12,}"
                 f"{cr_t:>14,}"
                 f"  ${cost:>11.4f}"
+                f"  {calls:>6}"
                 f"  ({jpy:,}円)"
             )
             print("=" * W)
@@ -1131,6 +1362,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--all", action="store_true", help="~/.claude/projects 以下の全ログをターン単位レートで集計して表示する。")
     p.add_argument("--month", nargs="?", const="current", metavar="YYYY-MM",
                    help="workspace 配下の全プロジェクトについて指定月の総合計を表示。省略時は当月。例: --month 2026-05")
+    p.add_argument("--cloudwatch", nargs="?", const="current", metavar="YYYY-MM",
+                   help="CloudWatch の Bedrock メトリクスから指定月の実 API コール数を取得（retry/Workflow内部コール含む）。省略時は当月。")
     p.add_argument("--system", help="system prompt を追加。")
     p.add_argument("--model-id", "-m", default=None, help="Bedrock modelId。未指定かつ --transcript 時はログから自動検出。例: anthropic.claude-opus-4-6-v1")
     p.add_argument("--profile", default=os.environ.get("AWS_PROFILE", DEFAULT_PROFILE), help=f"AWS profile 名。未指定時は AWS_PROFILE か '{DEFAULT_PROFILE}'。")
@@ -1157,6 +1390,17 @@ def main() -> int:
             return print_workspace_month_summary(dt.year, dt.month)
         except ValueError:
             print(f"Error: --month の形式が不正です: '{args.month}'。YYYY-MM で指定してください。", file=sys.stderr)
+            return 2
+    if args.cloudwatch is not None:
+        import datetime
+        if args.cloudwatch == "current":
+            now = datetime.date.today()
+            return print_cloudwatch_summary(now.year, now.month, args.profile, args.region)
+        try:
+            dt = datetime.datetime.strptime(args.cloudwatch, "%Y-%m")
+            return print_cloudwatch_summary(dt.year, dt.month, args.profile, args.region)
+        except ValueError:
+            print(f"Error: --cloudwatch の形式が不正です: '{args.cloudwatch}'。YYYY-MM で指定してください。", file=sys.stderr)
             return 2
     # 入力が一つも指定されなければ、カレントプロジェクトの最新ログを集計する（既定動作）。
     if not args.file and not args.text and not args.stdin and not args.conversation_json and not args.transcript:
@@ -1222,6 +1466,7 @@ def main() -> int:
         # 優先1: JSONL の message.usage を直接集計（実請求値）
         usage = read_usage_from_transcript(path)
         if usage is not None:
+            n_sub = count_subagents(path)
             print_transcript_summary(
                 path, display_model,
                 in_tokens=usage["input_tokens"],
@@ -1234,6 +1479,12 @@ def main() -> int:
                 cache_read_tokens=usage["cache_read_input_tokens"],
                 from_usage=True,
             )
+            if n_sub >= SUBAGENT_WARN_THRESHOLD:
+                print(f"\n⚠ 警告: このセッションは Workflow subagent を {n_sub} 件含みます。")
+                print(  "  Workflow の並列 subagent 起動時、キャッシュウォームアップ呼び出しが")
+                print(  "  JSONL に記録されず実請求額が上記集計より大幅に高くなる場合があります。")
+                print(  "  実績: n_sub=152 で実コスト ≈ JSONL 集計の 1.87 倍。")
+                print(  "  正確な確認は AWS Bedrock モデル呼び出しログ（CloudWatch Logs）を参照してください。")
             return 0
 
         # フォールバック: usage フィールドがない古いログは CountTokens で推定
